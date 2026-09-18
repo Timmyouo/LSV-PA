@@ -3,22 +3,34 @@
 #include "base/main/mainInt.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <vector>
 
 ABC_NAMESPACE_IMPL_START
 
 using Lsv_Cut_t = std::vector<int>;
+using Lsv_CutList_t = std::vector<Lsv_Cut_t>;
+using Lsv_NodeCuts_t = std::map<int, Lsv_CutList_t>;
 
 static int Lsv_CommandPrintNodes(Abc_Frame_t* pAbc, int argc, char** argv);
 static int Lsv_CommandCutTruthTable(Abc_Frame_t* pAbc, int argc, char** argv);
 
 static void Lsv_CutSort(Lsv_Cut_t& cut);
 static Lsv_Cut_t Lsv_CutMerge(const Lsv_Cut_t& cut0, const Lsv_Cut_t& cut1, int k);
-static void Lsv_CutPrint(const Lsv_Cut_t& cut);
-static void Lsv_CutMergeTest(int k);
-
-static void Lsv_PrintTrivialCuts(Abc_Ntk_t* pNtk);
+static void Lsv_CutInitPiCuts(Abc_Ntk_t* pNtk, Lsv_NodeCuts_t& nodeCuts);
+static bool Lsv_CutContains(const Lsv_CutList_t& cuts, const Lsv_Cut_t& cut);
+static void Lsv_CutSortList(Lsv_CutList_t& cuts);
+static void Lsv_CutEnumNode(Abc_Obj_t* pNode, int k, const Lsv_NodeCuts_t& nodeCuts,
+                            Lsv_CutList_t& cuts);
+static void Lsv_CutEnumNtk(Abc_Ntk_t* pNtk, int k, Lsv_NodeCuts_t& nodeCuts);
+static int Lsv_TruthTableSimulateRec(Abc_Obj_t* pObj, std::map<int, int>& memo,
+                                     const std::map<int, int>& leafVals);
+static uint64_t Lsv_TruthTableCompute(Abc_Obj_t* pRoot, const Lsv_Cut_t& cut);
+static void Lsv_TruthTablePrintHex(uint64_t tt);
+static void Lsv_CutPrintAll(Abc_Ntk_t* pNtk, const Lsv_NodeCuts_t& nodeCuts);
 
 void init(Abc_Frame_t* pAbc) {
   Cmd_CommandAdd(pAbc, "LSV", "lsv_print_nodes", Lsv_CommandPrintNodes, 0);
@@ -66,51 +78,194 @@ static Lsv_Cut_t Lsv_CutMerge(const Lsv_Cut_t& cut0, const Lsv_Cut_t& cut1, int 
   return merged;
 }
 
-static void Lsv_CutPrint(const Lsv_Cut_t& cut) {
-  printf("{");
-  for (size_t i = 0; i < cut.size(); ++i) {
-    printf("%s%d", (i == 0) ? "" : ",", cut[i]);
-  }
-  printf("}");
-}
+// Step 4b: store trivial cut {pi} for each PI.
+static void Lsv_CutInitPiCuts(Abc_Ntk_t* pNtk, Lsv_NodeCuts_t& nodeCuts) {
+  Abc_Obj_t* pObj;
+  int i;
 
-// Temporary sanity check for Step 4a; remove after Step 4c.
-static void Lsv_CutMergeTest(int k) {
-  Lsv_Cut_t result;
-
-  result = Lsv_CutMerge({1}, {2}, k);
-  printf("merge {1} + {2}, k=%d -> ", k);
-  Lsv_CutPrint(result);
-  printf("\n");
-
-  result = Lsv_CutMerge({1, 2}, {2, 3}, k);
-  printf("merge {1,2} + {2,3}, k=%d -> ", k);
-  Lsv_CutPrint(result);
-  printf("\n");
-
-  result = Lsv_CutMerge({1, 2}, {3, 4}, k);
-  printf("merge {1,2} + {3,4}, k=%d -> ", k);
-  if (result.empty()) {
-    printf("(invalid, size > k)\n");
-  } else {
-    Lsv_CutPrint(result);
-    printf("\n");
+  Abc_NtkForEachCi(pNtk, pObj, i) {
+    if (Abc_ObjFanoutNum(pObj) == 0) {
+      continue;
+    }
+    const int piId = Abc_ObjId(pObj);
+    nodeCuts[piId] = Lsv_CutList_t{Lsv_Cut_t{piId}};
   }
 }
 
-// Step 3: print trivial cut {n} for each internal AND node.
-static void Lsv_PrintTrivialCuts(Abc_Ntk_t* pNtk) {
+static bool Lsv_CutContains(const Lsv_CutList_t& cuts, const Lsv_Cut_t& cut) {
+  for (const Lsv_Cut_t& existing : cuts) {
+    if (existing == cut) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void Lsv_CutSortList(Lsv_CutList_t& cuts) {
+  for (Lsv_Cut_t& cut : cuts) {
+    Lsv_CutSort(cut);
+  }
+  std::sort(cuts.begin(), cuts.end(),
+            [](const Lsv_Cut_t& a, const Lsv_Cut_t& b) { return a < b; });
+}
+
+// Step 4c: enumerate cuts for one AND node.
+static void Lsv_CutEnumNode(Abc_Obj_t* pNode, int k, const Lsv_NodeCuts_t& nodeCuts,
+                            Lsv_CutList_t& cuts) {
+  const int nodeId = Abc_ObjId(pNode);
+
+  cuts.push_back(Lsv_Cut_t{nodeId});
+
+  const int fanin0Id = Abc_ObjId(Abc_ObjFanin0(pNode));
+  const int fanin1Id = Abc_ObjId(Abc_ObjFanin1(pNode));
+  auto it0 = nodeCuts.find(fanin0Id);
+  auto it1 = nodeCuts.find(fanin1Id);
+  if (it0 == nodeCuts.end() || it1 == nodeCuts.end()) {
+    Lsv_CutSortList(cuts);
+    return;
+  }
+
+  Lsv_CutList_t mergedCuts;
+  for (const Lsv_Cut_t& cut0 : it0->second) {
+    for (const Lsv_Cut_t& cut1 : it1->second) {
+      Lsv_Cut_t merged = Lsv_CutMerge(cut0, cut1, k);
+      if (merged.empty()) {
+        continue;
+      }
+      if (!Lsv_CutContains(mergedCuts, merged)) {
+        mergedCuts.push_back(std::move(merged));
+      }
+    }
+  }
+
+  for (Lsv_Cut_t& cut : mergedCuts) {
+    if (!Lsv_CutContains(cuts, cut)) {
+      cuts.push_back(std::move(cut));
+    }
+  }
+
+  Lsv_CutSortList(cuts);
+}
+
+// Step 4d: enumerate cuts for all AND nodes in topological order.
+static void Lsv_CutEnumNtk(Abc_Ntk_t* pNtk, int k, Lsv_NodeCuts_t& nodeCuts) {
+  Vec_Ptr_t* vNodes = Abc_AigDfs(pNtk, 0, 0);
+  Abc_Obj_t* pObj;
+  int i;
+
+  Lsv_CutInitPiCuts(pNtk, nodeCuts);
+
+  Vec_PtrForEachEntry(Abc_Obj_t*, vNodes, pObj, i) {
+    if (!Abc_AigNodeIsAnd(pObj)) {
+      continue;
+    }
+    Lsv_CutList_t cuts;
+    Lsv_CutEnumNode(pObj, k, nodeCuts, cuts);
+    nodeCuts[Abc_ObjId(pObj)] = std::move(cuts);
+  }
+
+  Vec_PtrFree(vNodes);
+}
+
+// Step 6: simulate AIG cone for general cuts.
+static int Lsv_TruthTableSimulateRec(Abc_Obj_t* pObj, std::map<int, int>& memo,
+                                     const std::map<int, int>& leafVals) {
+  pObj = Abc_ObjRegular(pObj);
+  const int id = Abc_ObjId(pObj);
+
+  auto leafIt = leafVals.find(id);
+  if (leafIt != leafVals.end()) {
+    return leafIt->second;
+  }
+
+  auto memoIt = memo.find(id);
+  if (memoIt != memo.end()) {
+    return memoIt->second;
+  }
+
+  if (Abc_AigNodeIsConst(pObj)) {
+    memo[id] = 1;
+    return 1;
+  }
+
+  if (Abc_AigNodeIsAnd(pObj)) {
+    int v0 = Lsv_TruthTableSimulateRec(Abc_ObjFanin0(pObj), memo, leafVals);
+    int v1 = Lsv_TruthTableSimulateRec(Abc_ObjFanin1(pObj), memo, leafVals);
+    if (Abc_ObjFaninC0(pObj)) {
+      v0 = !v0;
+    }
+    if (Abc_ObjFaninC1(pObj)) {
+      v1 = !v1;
+    }
+    memo[id] = v0 & v1;
+    return memo[id];
+  }
+
+  memo[id] = 0;
+  return 0;
+}
+
+static uint64_t Lsv_TruthTableCompute(Abc_Obj_t* pRoot, const Lsv_Cut_t& cut) {
+  const int k = (int)cut.size();
+
+  if (k == 1 && cut[0] == (int)Abc_ObjId(pRoot)) {
+    return 0x2;
+  }
+
+  uint64_t tt = 0;
+  for (int i = 0; i < (1 << k); ++i) {
+    std::map<int, int> leafVals;
+    for (int j = 0; j < k; ++j) {
+      leafVals[cut[j]] = (i >> (k - 1 - j)) & 1;
+    }
+
+    std::map<int, int> memo;
+    if (Lsv_TruthTableSimulateRec(pRoot, memo, leafVals)) {
+      tt |= (1ULL << i);
+    }
+  }
+  return tt;
+}
+
+static void Lsv_TruthTablePrintHex(uint64_t tt) {
+  char buffer[32];
+  std::snprintf(buffer, sizeof(buffer), "%llx", (unsigned long long)tt);
+
+  char* p = buffer;
+  while (p[0] == '0' && p[1] != '\0') {
+    ++p;
+  }
+  std::printf("%s", p);
+}
+
+static void Lsv_CutPrintAll(Abc_Ntk_t* pNtk, const Lsv_NodeCuts_t& nodeCuts) {
   Abc_Obj_t* pObj;
   int i;
 
   Abc_AigForEachAnd(pNtk, pObj, i) {
     const int nodeId = Abc_ObjId(pObj);
-    printf("%d: %d\n", nodeId, nodeId);
+    auto it = nodeCuts.find(nodeId);
+    if (it == nodeCuts.end()) {
+      continue;
+    }
+
+    for (const Lsv_Cut_t& cut : it->second) {
+      const uint64_t tt = Lsv_TruthTableCompute(pObj, cut);
+
+      printf("%d:", nodeId);
+      for (int leaf : cut) {
+        printf(" %d", leaf);
+      }
+      printf(": ");
+      Lsv_TruthTablePrintHex(tt);
+      printf("\n");
+    }
   }
 }
 
 static int Lsv_CommandCutTruthTable(Abc_Frame_t* pAbc, int argc, char** argv) {
   Abc_Ntk_t* pNtk = Abc_FrameReadNtk(pAbc);
+  Lsv_NodeCuts_t nodeCuts;
   int k;
 
   if (!pNtk) {
@@ -133,8 +288,8 @@ static int Lsv_CommandCutTruthTable(Abc_Frame_t* pAbc, int argc, char** argv) {
     return 1;
   }
 
-  Lsv_CutMergeTest(k);
-  Lsv_PrintTrivialCuts(pNtk);
+  Lsv_CutEnumNtk(pNtk, k, nodeCuts);
+  Lsv_CutPrintAll(pNtk, nodeCuts);
   return 0;
 }
 
